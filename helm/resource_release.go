@@ -190,6 +190,52 @@ func resourceRelease() *schema.Resource {
 				Default:     true,
 				Description: "Will wait until all resources are in a ready state before marking the release as successful.",
 			},
+			"release_tests": {
+				Type:        schema.TypeList,
+				MaxItems:    1,
+				Optional:    true,
+				Description: "Will run a helm test after chart creation and update.",
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"enabled": {
+							Type:        schema.TypeBool,
+							Optional:    true,
+							Default:     false,
+							Description: "Run release tests after upgrade/install.",
+						},
+						"timeout": {
+							Type:        schema.TypeInt,
+							Optional:    true,
+							Default:     120,
+							Description: "Specifies the number of seconds before kubernetes calls timeout",
+						},
+						"cleanup": {
+							Type:        schema.TypeBool,
+							Optional:    true,
+							Default:     true,
+							Description: "Specifies whether to cleanup test pods",
+						},
+						"parallel": {
+							Type:        schema.TypeBool,
+							Optional:    true,
+							Default:     false,
+							Description: "Specifies whether to run test pods in parallel",
+						},
+						"max_parallel": {
+							Type:        schema.TypeInt,
+							Optional:    true,
+							Default:     1,
+							Description: "Specifies maximum number of test pods to run in parallel",
+						},
+						"logs": {
+							Type:        schema.TypeBool,
+							Optional:    true,
+							Default:     false,
+							Description: "Specifies whether to dump the logs from test pods",
+						},
+					},
+				},
+			},
 			"status": {
 				Type:        schema.TypeString,
 				Computed:    true,
@@ -352,7 +398,78 @@ func resourceReleaseCreate(d *schema.ResourceData, meta interface{}) error {
 		return err
 	}
 
-	return setIDAndMetadataFromRelease(d, res.Release)
+	err = setIDAndMetadataFromRelease(d, res.Release)
+	if err != nil {
+		return err
+	}
+
+	err = runReleaseTest(d, c)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func getStruct(d *schema.ResourceData, field string) (map[string]interface{}, error) {
+	data := d.Get(field).([]interface{})
+	if len(data) == 0 {
+		return nil, fmt.Errorf("Error reading data for release_tests")
+	}
+	return data[0].(map[string]interface{}), nil
+}
+
+func runReleaseTest(d *schema.ResourceData, c helm.Interface) error {
+	releaseName := d.Get("name").(string)
+	testConfig, err := getStruct(d, "release_tests")
+
+	if err != nil {
+		return err
+	}
+
+	if testConfig["enabled"].(bool) {
+		debug("Running release tests for %v", releaseName)
+		testOpts := []helm.ReleaseTestOption{
+			helm.ReleaseTestTimeout(int64(testConfig["timeout"].(int))),
+			helm.ReleaseTestCleanup(testConfig["cleanup"].(bool)),
+			helm.ReleaseTestParallel(testConfig["parallel"].(bool)),
+			helm.ReleaseTestMaxParallel(uint32(testConfig["max_parallel"].(int))),
+			helm.ReleaseTestLogs(testConfig["logs"].(bool)),
+		}
+
+		msgs, errs := c.RunReleaseTest(releaseName, testOpts...)
+
+		var errors []string
+		for end := false; end != true; {
+			select {
+			case msg := <-msgs:
+				if msg != nil {
+					debug("received message: %v", msg)
+					if msg.GetStatus() != release.TestRun_RUNNING {
+						end = true
+					}
+
+					if msg.GetStatus() == release.TestRun_FAILURE || msg.GetStatus() == release.TestRun_UNKNOWN {
+						errors = append(errors, msg.GetMsg())
+					}
+				}
+			case err := <-errs:
+				if err != nil {
+					debug("received error: %v", err)
+					errors = append(errors, err.Error())
+					end = true
+				}
+			}
+		}
+
+		if len(errors) > 0 {
+			return fmt.Errorf("Release tests failed:\n%v", strings.Join(errors, "\n"))
+		}
+
+		return nil
+	}
+
+	return nil
 }
 
 func resourceReleaseRead(d *schema.ResourceData, meta interface{}) error {
@@ -424,7 +541,17 @@ func resourceReleaseUpdate(d *schema.ResourceData, meta interface{}) error {
 		return err
 	}
 
-	return setIDAndMetadataFromRelease(d, res.Release)
+	err = setIDAndMetadataFromRelease(d, res.Release)
+	if err != nil {
+		return err
+	}
+
+	err = runReleaseTest(d, c)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func resourceReleaseDelete(d *schema.ResourceData, meta interface{}) error {
